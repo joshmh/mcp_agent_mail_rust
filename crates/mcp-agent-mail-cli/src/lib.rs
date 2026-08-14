@@ -37876,6 +37876,94 @@ mod mail_server_cli_bridge_tests {
     }
 
     #[test]
+    fn idempotent_reads_retry_on_every_unavailable_class_failure() {
+        // A daemon stalled in an archive-read snapshot build fails the first
+        // proxy attempt and routinely serves the second from the warmed
+        // snapshot (projects-am-daemon-splitbrain-cpu-4ba); reads have no
+        // side effects, so every unavailable-class shape is retryable.
+        for message in [
+            "transport failure calling http://127.0.0.1:8765/mcp/: Resource temporarily \
+             unavailable (os error 11)",
+            "transport failure calling http://127.0.0.1:8765/mcp/: connection refused",
+            "request to http://127.0.0.1:8765/mcp/ timed out after 10s",
+            "unexpected HTTP status 503 from http://127.0.0.1:8765/mcp/",
+        ] {
+            for tool in ["fetch_inbox", "list_agents", "whois"] {
+                assert!(
+                    should_retry_server_tool_call(tool, &CliError::Other(message.to_string())),
+                    "{tool} should retry on: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mutations_retry_only_when_the_request_provably_never_arrived() {
+        // Nothing accepted the connection: replay cannot duplicate.
+        assert!(should_retry_server_tool_call(
+            "send_message",
+            &CliError::Other(
+                "transport failure calling http://127.0.0.1:8765/mcp/: connection refused"
+                    .to_string()
+            )
+        ));
+        // Ambiguous shapes — the server may have applied the mutation before
+        // the client gave up. These must keep the single-shot semantics so
+        // the pending-send/replay machinery stays the only at-least-once
+        // path (no silent duplicate mail from an eager retry).
+        for message in [
+            "transport failure calling http://127.0.0.1:8765/mcp/: Resource temporarily \
+             unavailable (os error 11)",
+            "request to http://127.0.0.1:8765/mcp/ timed out after 10s",
+            "unexpected HTTP status 503 from http://127.0.0.1:8765/mcp/",
+        ] {
+            assert!(
+                !should_retry_server_tool_call(
+                    "send_message",
+                    &CliError::Other(message.to_string())
+                ),
+                "send_message must not retry on: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_tools_get_the_conservative_mutation_retry_policy() {
+        assert!(!server_tool_is_idempotent_read("brand_new_tool"));
+        assert!(!should_retry_server_tool_call(
+            "brand_new_tool",
+            &CliError::Other(
+                "request to http://127.0.0.1:8765/mcp/ timed out after 10s".to_string()
+            )
+        ));
+        assert!(should_retry_server_tool_call(
+            "brand_new_tool",
+            &CliError::Other(
+                "transport failure calling http://127.0.0.1:8765/mcp/: connection refused"
+                    .to_string()
+            )
+        ));
+    }
+
+    #[test]
+    fn rejections_are_never_retried_even_for_reads() {
+        // 4xx and JSON-RPC-level rejections are deterministic answers, not
+        // daemon unavailability; retrying them only burns the caller's time.
+        for message in [
+            "unexpected HTTP status 404 from http://127.0.0.1:8765/mcp/",
+            "authentication failed: bad bearer token",
+        ] {
+            assert!(
+                !should_retry_server_tool_call(
+                    "fetch_inbox",
+                    &CliError::Other(message.to_string())
+                ),
+                "fetch_inbox must not retry on: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn classify_server_tool_call_treats_http_5xx_as_unavailable() {
         let result = classify_server_tool_call(
             "fetch_inbox",
@@ -77447,6 +77535,64 @@ fn parse_tool_result_error(payload: &serde_json::Value) -> Option<String> {
     Some("tool execution failed".to_string())
 }
 
+/// Total HTTP attempts per proxied tool call, and the backoff before each
+/// retry. Three 10 s attempts plus 1 s of backoff stay inside the server's
+/// 30 s read-dispatch budget, so a retried call can still land while the
+/// daemon finishes the archive-read snapshot build that starved attempt 1
+/// (projects-am-daemon-splitbrain-cpu-4ba).
+const SERVER_TOOL_TRANSPORT_ATTEMPTS: usize = 3;
+const SERVER_TOOL_TRANSPORT_BACKOFF_MS: [u64; 2] = [250, 750];
+
+/// Tools the CLI may replay freely after a transport-level failure: reads
+/// with no mailbox side effects. Everything NOT listed is treated as a
+/// mutation — unknown or new tool names get the conservative policy.
+const SERVER_TOOL_IDEMPOTENT_READS: &[&str] = &[
+    "check_file_reservation_conflicts",
+    "fetch_inbox",
+    "fetch_inbox_product",
+    "health_check",
+    "list_agents",
+    "list_contacts",
+    "search_messages",
+    "search_messages_product",
+    "summarize_thread",
+    "summarize_thread_product",
+    "whois",
+];
+
+fn server_tool_is_idempotent_read(tool_name: &str) -> bool {
+    SERVER_TOOL_IDEMPOTENT_READS.contains(&tool_name)
+}
+
+/// A transport failure whose shape proves the request never reached a
+/// server: nothing accepted the connection, so replaying cannot duplicate a
+/// mutation. Read timeouts and HTTP 5xx do NOT qualify — the server may
+/// have accepted and applied the request before the client gave up.
+fn transport_failure_never_reached_server(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("connection refused")
+        || lower.contains("connect refused")
+        || lower.contains("failed to connect")
+        || lower.contains("connect timed out")
+        || lower.contains("connection reset before request")
+}
+
+/// Whether one failed proxy attempt for `tool_name` is safe and useful to
+/// retry. Idempotent reads retry on every unavailable-class failure
+/// (transport failure, timeout, HTTP 5xx). Mutations retry only when the
+/// failure proves the request never reached a server; an ambiguous timeout
+/// on a mutation keeps the existing single-shot semantics so the
+/// pending-send/replay machinery stays the sole at-least-once path.
+fn should_retry_server_tool_call(tool_name: &str, error: &CliError) -> bool {
+    if !server_tool_error_is_unavailable(error) {
+        return false;
+    }
+    if server_tool_is_idempotent_read(tool_name) {
+        return true;
+    }
+    transport_failure_never_reached_server(&error.to_string())
+}
+
 pub(crate) async fn try_call_server_tool(
     server_url: &str,
     bearer: Option<&str>,
@@ -77462,10 +77608,36 @@ pub(crate) async fn try_call_server_tool(
             "arguments": arguments,
         }
     });
-    classify_server_tool_call(
-        tool_name,
-        post_jsonrpc_request(server_url, bearer, &req, 10).await,
-    )
+    let mut attempt = 0;
+    loop {
+        let response = post_jsonrpc_request(server_url, bearer, &req, 10).await;
+        match response {
+            Err(ref error)
+                if attempt + 1 < SERVER_TOOL_TRANSPORT_ATTEMPTS
+                    && should_retry_server_tool_call(tool_name, error) =>
+            {
+                // A daemon mid-snapshot-build routinely fails attempt 1 and
+                // serves attempt 2 from the freshly warmed snapshot; without
+                // this retry the failure surfaces as the split-brain
+                // local-fallback refusal even though the daemon is healthy.
+                tracing::debug!(
+                    tool = tool_name,
+                    attempt = attempt + 1,
+                    error = %error,
+                    "server tool call transport failure; retrying"
+                );
+                let backoff = SERVER_TOOL_TRANSPORT_BACKOFF_MS
+                    [attempt.min(SERVER_TOOL_TRANSPORT_BACKOFF_MS.len() - 1)];
+                asupersync::time::sleep(
+                    asupersync::time::wall_now(),
+                    std::time::Duration::from_millis(backoff),
+                )
+                .await;
+                attempt += 1;
+            }
+            _ => return classify_server_tool_call(tool_name, response),
+        }
+    }
 }
 
 fn coerce_tool_result_json(result: serde_json::Value) -> Option<serde_json::Value> {
