@@ -1,0 +1,231 @@
+From ede90cc110fb160b43ccb552d36283700a6ebb6a Mon Sep 17 00:00:00 2001
+From: Josh Harvey <josh@hypha.ch>
+Date: Fri, 14 Aug 2026 23:51:22 +0000
+Subject: [PATCH] fix(cli): report check-inbox result
+ (aud-checkinbox-silent-329)
+
+---
+ crates/mcp-agent-mail-cli/src/lib.rs | 39 +++++++++++++++++++-------
+ tests/e2e/test_check_inbox.sh        | 41 ++++++++++++++++++++--------
+ 2 files changed, 58 insertions(+), 22 deletions(-)
+
+diff --git a/crates/mcp-agent-mail-cli/src/lib.rs b/crates/mcp-agent-mail-cli/src/lib.rs
+index f3f82bd7..377014c9 100644
+--- a/crates/mcp-agent-mail-cli/src/lib.rs
++++ b/crates/mcp-agent-mail-cli/src/lib.rs
+@@ -8146,7 +8146,7 @@ const fn check_inbox_should_use_daemon(direct: bool, daemon_reachable: bool) ->
+ /// Handle the check-inbox command.
+ ///
+ /// Checks the agent inbox for unread messages. Designed for git hooks and editor integrations.
+-/// Exits silently on any error (fail-safe for hooks - never interrupt agent work).
++/// Reports read failures but still exits successfully so hooks never interrupt agent work.
+ #[allow(clippy::too_many_arguments)]
+ fn handle_check_inbox(
+     agent: Option<String>,
+@@ -8231,7 +8231,7 @@ fn handle_check_inbox(
+             // The daemon went away between the reachability probe and the call.
+             // Honor the co-located `--direct` intent with a direct SQLite read.
+             let config = CheckInboxDirectConfig {
+-                project_key,
++                project_key: project_key.clone(),
+                 agent_name: agent_name.clone(),
+                 limit: CHECK_INBOX_FETCH_LIMIT,
+             };
+@@ -8242,26 +8242,38 @@ fn handle_check_inbox(
+     } else {
+         // No daemon is listening — read SQLite directly (the fast co-located path).
+         let config = CheckInboxDirectConfig {
+-            project_key,
++            project_key: project_key.clone(),
+             agent_name: agent_name.clone(),
+             limit: CHECK_INBOX_FETCH_LIMIT,
+         };
+         check_inbox_direct(&config)
+     };
+ 
+-    // Handle result - exit silently on any error (fail-safe for hooks)
++    // Report failures while preserving the fail-safe exit code expected by hooks. A silent
++    // success is unsafe for callers that use this command as a mail-presence gate because it is
++    // indistinguishable from a successful check that found no unread messages.
+     let result = match result {
+         Ok(r) => r,
+-        Err(_) => return Ok(()), // Fail silently
++        Err(error) => {
++            let output_data = serde_json::json!({
++                "checked": false,
++                "agent": agent_name,
++                "project": project_key,
++                "unread_count": serde_json::Value::Null,
++                "error": error.to_string(),
++            });
++            output::emit_output(&output_data, fmt, || {
++                ftui_runtime::ftui_println!(
++                    "⚠️  Inbox check did not run for {agent_name}: {error}"
++                );
++            });
++            return Ok(());
++        }
+     };
+ 
+-    // No messages - exit silently
+-    if result.unread_count == 0 {
+-        return Ok(());
+-    }
+-
+     // Build output data for JSON/TOON
+     let output_data = serde_json::json!({
++        "checked": true,
+         "agent": agent_name,
+         "unread_count": result.unread_count,
+         "urgent_or_high_count": result.urgent_or_high_count,
+@@ -8277,6 +8289,11 @@ fn handle_check_inbox(
+     });
+ 
+     output::emit_output(&output_data, fmt, || {
++        if result.unread_count == 0 {
++            ftui_runtime::ftui_println!("Inbox checked: 0 unread messages for {agent_name}.");
++            return;
++        }
++
+         // Human-readable output with emoji
+         ftui_runtime::ftui_println!();
+         ftui_runtime::ftui_println!("📬 === INBOX REMINDER ===");
+@@ -41150,6 +41167,7 @@ http_headers = { Authorization = "Bearer secret" }
+         assert_eq!(payload["params"]["arguments"]["agent_name"], "BlueLake");
+         assert_eq!(payload["params"]["arguments"]["limit"], 10);
+         assert_eq!(payload["params"]["arguments"]["include_bodies"], false);
++        assert_eq!(payload["params"]["arguments"]["unread_only"], true);
+         // GH#207: check-inbox is a non-consuming peek — it must always ask
+         // the daemon's fetch_inbox NOT to mark the returned messages read.
+         assert_eq!(payload["params"]["arguments"]["mark_read"], false);
+@@ -75666,6 +75684,7 @@ fn build_fetch_inbox_jsonrpc_request(config: &CheckInboxRpcConfig) -> serde_json
+                 "agent_name": config.agent_name,
+                 "limit": config.limit,
+                 "include_bodies": config.include_bodies,
++                "unread_only": true,
+                 // check-inbox is a monitoring peek for hooks and editors; it
+                 // must never consume unread state (GH#207).
+                 "mark_read": false,
+diff --git a/tests/e2e/test_check_inbox.sh b/tests/e2e/test_check_inbox.sh
+index 6c61caad..da6f1bb1 100755
+--- a/tests/e2e/test_check_inbox.sh
++++ b/tests/e2e/test_check_inbox.sh
+@@ -7,7 +7,7 @@
+ # - Rate limiting: Stamp-file-based check throttling
+ # - Output modes: JSON vs human-readable (emoji)
+ # - Template detection: Silent exit for placeholder values
+-# - Error handling: Fail-safe for hooks (silent exit on errors)
++# - Error handling: Fail-safe exit code with visible did-not-run status
+ # - Exit codes: 0 on success/skip, proper signal handling
+ #
+ # Artifacts (via e2e_lib.sh helpers):
+@@ -265,7 +265,7 @@ mkdir -p "$RATE_LIMIT_PROJECT"
+ 
+ e2e_case_banner "First check creates stamp file"
+ e2e_mark_case_start "rate_limit_first"
+-# Note: This will fail silently because there's no server, but should create the stamp file.
++# The read will report a connection failure, but it should still create the stamp file.
+ run_check_inbox "rate_limit_first" --agent "RateLimitAgent" --project "$RATE_LIMIT_PROJECT" \
+     --rate-limit 3600 --host "127.0.0.1" --port 65432
+ e2e_assert_exit_code "first check exit code" "0" "$_EXIT_CODE"
+@@ -289,7 +289,7 @@ e2e_mark_case_end "rate_limit_second"
+ e2e_case_banner "Rate limit 0 disables rate limiting"
+ e2e_mark_case_start "rate_limit_zero"
+ run_check_inbox "rate_limit_zero" --agent "RateLimitAgent" --rate-limit 0 --host "127.0.0.1" --port 65432
+-# Even with rate-limit 0, should still exit silently if server not available
++# Even with rate-limit 0, an unavailable server must keep the hook-safe exit code.
+ e2e_assert_exit_code "rate-limit-0 exit code" "0" "$_EXIT_CODE"
+ e2e_mark_case_end "rate_limit_zero"
+ 
+@@ -333,7 +333,7 @@ if [ "$SEED_SUCCESS" = "1" ]; then
+         --host "127.0.0.1" --port "$HTTP_PORT" --rate-limit 0 --json
+     e2e_assert_exit_code "http json exit code" "0" "$_EXIT_CODE"
+     # Validate JSON structure
+-    if echo "$_STDOUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'agent' in d and 'unread_count' in d" 2>/dev/null; then
++    if echo "$_STDOUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['checked'] is True and 'agent' in d and d['unread_count'] > 0" 2>/dev/null; then
+         e2e_pass "http json valid structure"
+     else
+         e2e_fail "http json invalid structure"
+@@ -344,12 +344,28 @@ else
+     e2e_skip "HTTP mode with messages tests (seeding failed - pre-existing bug in register_agent)"
+ fi
+ 
+-e2e_case_banner "HTTP mode with non-existent agent (silent exit)"
++e2e_rpc_call "seed_empty_agent" "$E2E_SERVER_URL" "register_agent" \
++    "{\"project_key\":\"${PROJECT_KEY}\",\"program\":\"test\",\"model\":\"test\",\"name\":\"SilverMeadow\"}" || true
++
++e2e_case_banner "HTTP mode reports a successful zero-message check"
++e2e_mark_case_start "http_zero_json"
++run_check_inbox "http_zero_json" --agent "SilverMeadow" --project "$PROJECT_KEY" \
++    --host "127.0.0.1" --port "$HTTP_PORT" --rate-limit 0 --json
++e2e_assert_exit_code "http zero json exit code" "0" "$_EXIT_CODE"
++if echo "$_STDOUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['checked'] is True and d['unread_count'] == 0" 2>/dev/null; then
++    e2e_pass "http zero json reports checked count"
++else
++    e2e_fail "http zero json did not report checked count"
++    echo "stdout: $_STDOUT"
++fi
++e2e_mark_case_end "http_zero_json"
++
++e2e_case_banner "HTTP mode with non-existent agent reports did-not-run"
+ e2e_mark_case_start "http_no_agent"
+ run_check_inbox "http_no_agent" --agent "GhostWolf" --project "$PROJECT_KEY" \
+     --host "127.0.0.1" --port "$HTTP_PORT" --rate-limit 0
+ e2e_assert_exit_code "http no agent exit code" "0" "$_EXIT_CODE"
+-# Should exit silently (fail-safe for hooks)
++e2e_assert_contains "http no agent reports did-not-run" "$_STDOUT" "did not run"
+ e2e_mark_case_end "http_no_agent"
+ 
+ e2e_stop_server
+@@ -404,7 +420,7 @@ if [ "$SEED_SUCCESS" = "1" ]; then
+         --direct --rate-limit 0 --json
+     e2e_assert_exit_code "direct json exit code" "0" "$_EXIT_CODE"
+     # Validate JSON structure
+-    if echo "$_STDOUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'agent' in d and 'unread_count' in d" 2>/dev/null; then
++    if echo "$_STDOUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['checked'] is True and 'agent' in d and d['unread_count'] > 0" 2>/dev/null; then
+         e2e_pass "direct json valid structure"
+     else
+         e2e_fail "direct json invalid structure"
+@@ -415,12 +431,12 @@ else
+     e2e_skip "Direct mode with messages tests (seeding failed - pre-existing bug in register_agent)"
+ fi
+ 
+-e2e_case_banner "Direct mode with non-existent agent (silent exit)"
++e2e_case_banner "Direct mode with non-existent agent reports did-not-run"
+ e2e_mark_case_start "direct_no_agent"
+ run_check_inbox "direct_no_agent" --agent "PurpleFox" --project "$PROJECT_KEY" \
+     --direct --rate-limit 0
+ e2e_assert_exit_code "direct no agent exit code" "0" "$_EXIT_CODE"
+-# Should exit silently
++e2e_assert_contains "direct no agent reports did-not-run" "$_STDOUT" "did not run"
+ e2e_mark_case_end "direct_no_agent"
+ 
+ unset DATABASE_URL STORAGE_ROOT
+@@ -446,20 +462,21 @@ e2e_mark_case_end "no_agent_config"
+ 
+ e2e_banner "Run 6: Error handling (fail-safe)"
+ 
+-e2e_case_banner "Connection refused exits silently"
++e2e_case_banner "Connection refused reports did-not-run and exits successfully"
+ e2e_mark_case_start "conn_refused"
+ run_check_inbox "conn_refused" --agent "SilentBear" --project "/tmp/nonexistent" \
+     --host "127.0.0.1" --port 65432 --rate-limit 0
+ e2e_assert_exit_code "conn refused exit code" "0" "$_EXIT_CODE"
+-# Should exit silently - fail-safe for hooks
++e2e_assert_contains "conn refused reports did-not-run" "$_STDOUT" "did not run"
+ e2e_mark_case_end "conn_refused"
+ 
+-e2e_case_banner "Invalid project path in direct mode exits silently"
++e2e_case_banner "Invalid project path in direct mode reports did-not-run"
+ e2e_mark_case_start "direct_invalid_project"
+ export DATABASE_URL="sqlite:////nonexistent/path/db.sqlite3"
+ run_check_inbox "direct_invalid_project" --agent "QuietFrog" \
+     --project "/nonexistent/project" --direct --rate-limit 0
+ e2e_assert_exit_code "direct invalid project exit code" "0" "$_EXIT_CODE"
++e2e_assert_contains "direct invalid project reports did-not-run" "$_STDOUT" "did not run"
+ unset DATABASE_URL
+ e2e_mark_case_end "direct_invalid_project"
+ 
+-- 
+2.48.1
+
