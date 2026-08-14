@@ -15856,6 +15856,26 @@ fn readiness_check_with_integrity(
     let startup_integrity_fingerprint = sqlite_startup_fingerprint(&conn, &config.database_url);
     drop(conn);
 
+    // Optional ATC workers run immediately after readiness. Initialize their
+    // dedicated sidecar first so a fresh mailbox cannot race the first
+    // operator tick against a missing table. This is the supported migration
+    // path and stays fail-closed on real schema or integrity failures.
+    match block_on(pool.ensure_atc_schema_initialized(&cx)) {
+        asupersync::Outcome::Ok(()) => {}
+        asupersync::Outcome::Err(error) => {
+            return Err(format!("ATC schema initialization failed: {error}"));
+        }
+        asupersync::Outcome::Cancelled(_) => {
+            return Err("ATC schema initialization cancelled".to_string());
+        }
+        asupersync::Outcome::Panicked(payload) => {
+            return Err(format!(
+                "ATC schema initialization panicked: {}",
+                payload.message()
+            ));
+        }
+    }
+
     let skip_startup_integrity =
         startup_integrity_fingerprint
             .as_ref()
@@ -16884,8 +16904,10 @@ mod tests {
     use asupersync::http::h1::types::Version as Http1Version;
     use chrono::Utc;
     use ftui_runtime::stdio_capture::StdioCapture;
+    use std::io::Write;
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
 
     static STDIO_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
     static TUI_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -16894,6 +16916,40 @@ mod tests {
     static HEALTH_COUNT_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static DISPATCH_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    #[derive(Clone, Default)]
+    struct WarningLog(Arc<Mutex<Vec<u8>>>);
+
+    struct WarningLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for WarningLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("warning log lock poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for WarningLog {
+        type Writer = WarningLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            WarningLogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    impl WarningLog {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("warning log lock poisoned").clone())
+                .expect("warning log must be UTF-8")
+        }
+    }
 
     struct NoopTool;
 
@@ -17472,6 +17528,100 @@ mod tests {
         assert_eq!(
             note.as_deref(),
             Some("ATC tick exceeded budget: 8000us > 5000us")
+        );
+    }
+
+    #[test]
+    fn fresh_mailbox_startup_and_first_atc_tick_are_warning_free() {
+        let temp = tempfile::tempdir().expect("fresh mailbox tempdir");
+        let db_path = temp.path().join("storage.sqlite3");
+        let storage_root = temp.path().join("mailbox");
+        std::fs::create_dir(&storage_root).expect("create fresh mailbox root");
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path);
+        let config = mcp_agent_mail_core::Config {
+            database_url: database_url.clone(),
+            storage_root: storage_root.clone(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let warning_log = WarningLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(warning_log.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            readiness_check_with_integrity(&config, true)
+                .expect("fresh mailbox readiness must pass");
+
+            let pool = create_pool(&DbPoolConfig {
+                database_url,
+                storage_root: Some(storage_root),
+                min_connections: 1,
+                max_connections: 1,
+                warmup_connections: 0,
+                ..DbPoolConfig::default()
+            })
+            .expect("open initialized fresh mailbox pool");
+            let cx = Cx::for_testing();
+
+            let rollup = block_on(mcp_agent_mail_db::atc_queries::refresh_rollups(
+                &cx,
+                &pool,
+                mcp_agent_mail_db::now_micros(),
+                ATC_ROLLUP_REFRESH_LOOKBACK_MICROS,
+            ))
+            .into_result()
+            .expect("first ATC rollup refresh must succeed");
+            assert_eq!(rollup.rows_scanned, 0);
+            assert_eq!(rollup.strata_updated, 0);
+            assert_eq!(
+                mcp_agent_mail_db::atc_queries::enforce_experience_row_ceiling(&pool, 100)
+                    .expect("first experience ceiling sweep must succeed"),
+                0
+            );
+            assert!(
+                pool.sample_recent_message_refs(50)
+                    .expect("fresh consistency probe must succeed")
+                    .is_empty()
+            );
+            assert!(
+                pool.run_full_integrity_check()
+                    .expect("fresh full integrity check must succeed")
+                    .ok
+            );
+
+            let atc_path = pool.atc_sqlite_path().expect("file-backed ATC path");
+            let atc_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&atc_path)
+                .expect("open initialized ATC sidecar");
+            let rows = atc_conn
+                .query_sync(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (\
+                     'atc_experiences', 'atc_experience_rollups', \
+                     'atc_leader_lease', 'atc_rollup_snapshots') ORDER BY name",
+                    &[],
+                )
+                .expect("inspect ATC startup schema");
+            assert_eq!(
+                rows.len(),
+                4,
+                "all ATC worker tables must exist before the first tick"
+            );
+        });
+
+        let warnings = warning_log.text();
+        // Config's test-harness guard intentionally warns when an internal
+        // helper evaluates the default home archive. It cannot occur in the
+        // production startup exercised here and is unrelated to the mailbox
+        // under test; keep every other warning fatal.
+        let unexpected_warnings = warnings
+            .lines()
+            .filter(|line| !line.contains("while running under a cargo/nextest/insta test harness"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            unexpected_warnings.trim().is_empty(),
+            "fresh startup and first ATC tick emitted warnings:\n{unexpected_warnings}"
         );
     }
 

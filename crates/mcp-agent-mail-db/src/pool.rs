@@ -2448,6 +2448,15 @@ impl DbPool {
         self.atc_experience_max_rows
     }
 
+    /// Initialize and validate every table required by file-backed ATC workers.
+    ///
+    /// Server readiness calls this before any optional ATC worker starts. A
+    /// missing or incomplete sidecar is repaired through the supported
+    /// migration path; migration and integrity failures remain fatal.
+    pub async fn ensure_atc_schema_initialized(&self, cx: &Cx) -> Outcome<(), DbError> {
+        crate::queries::ensure_file_backed_atc_pool_initialized(cx, self).await
+    }
+
     #[must_use]
     pub fn storage_root(&self) -> &std::path::Path {
         &self.storage_root
@@ -2761,7 +2770,7 @@ impl DbPool {
             });
         }
 
-        let conn = crate::guard_db_conn(
+        let conn = crate::guard_read_db_conn(
             match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
                 Ok(conn) => conn,
                 Err(e) => {
@@ -2825,7 +2834,7 @@ impl DbPool {
                 // restored file will reproduce the same schema and trip the same
                 // false positive. Without the fallback we'd return Err here and
                 // re-wedge recovery.mode despite canonical accepting the file.
-                let conn = crate::guard_db_conn(
+                let conn = crate::guard_read_db_conn(
                     open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|e| {
                         DbError::Sqlite(format!(
                             "startup integrity check (post-recovery): open failed: {e}"
@@ -2856,7 +2865,7 @@ impl DbPool {
                     )));
                 }
 
-                let conn = crate::guard_db_conn(
+                let conn = crate::guard_read_db_conn(
                     open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
                         DbError::Sqlite(format!(
                             "startup integrity check (post-recovery): open failed: {reopen}"
@@ -2988,7 +2997,7 @@ impl DbPool {
             });
         }
 
-        let conn = crate::guard_db_conn(
+        let conn = crate::guard_read_db_conn(
             match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
                 Ok(conn) => conn,
                 Err(e) => {
@@ -3051,7 +3060,7 @@ impl DbPool {
         // Keep consistency sampling on FrankenSQLite and avoid JOIN-heavy scans:
         // 1) fetch recent envelopes
         // 2) resolve slugs/names via batched point lookups
-        let conn = crate::guard_db_conn(
+        let conn = crate::guard_read_db_conn(
             open_sqlite_file_with_lock_retry(&self.sqlite_path)
                 .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?,
             "consistency probe connection",

@@ -373,9 +373,20 @@ pub fn close_db_conn(conn: DbConn, context: &'static str) {
     }
 }
 
+pub fn close_db_conn_without_checkpoint(conn: DbConn, context: &'static str) {
+    if let Err(error) = conn.close_without_checkpoint_sync() {
+        tracing::warn!(
+            context,
+            error = %error,
+            "failed to close read-only FrankenSQLite connection explicitly"
+        );
+    }
+}
+
 pub struct DbConnGuard {
     conn: Option<DbConn>,
     context: &'static str,
+    checkpoint_on_close: bool,
 }
 
 impl DbConnGuard {
@@ -384,6 +395,16 @@ impl DbConnGuard {
         Self {
             conn: Some(conn),
             context,
+            checkpoint_on_close: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn new_without_checkpoint(conn: DbConn, context: &'static str) -> Self {
+        Self {
+            conn: Some(conn),
+            context,
+            checkpoint_on_close: false,
         }
     }
 
@@ -410,7 +431,11 @@ impl std::ops::DerefMut for DbConnGuard {
 impl Drop for DbConnGuard {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            close_db_conn(conn, self.context);
+            if self.checkpoint_on_close {
+                close_db_conn(conn, self.context);
+            } else {
+                close_db_conn_without_checkpoint(conn, self.context);
+            }
         }
     }
 }
@@ -418,6 +443,17 @@ impl Drop for DbConnGuard {
 #[must_use]
 pub const fn guard_db_conn(conn: DbConn, context: &'static str) -> DbConnGuard {
     DbConnGuard::new(conn, context)
+}
+
+/// Guard a read-only FrankenSQLite connection and close it without a WAL
+/// checkpoint.
+///
+/// Read probes do not create durable work that needs checkpointing. Skipping
+/// the close-time checkpoint prevents benign contention with the live pool
+/// writer while preserving an explicit close and its warning on real failure.
+#[must_use]
+pub const fn guard_read_db_conn(conn: DbConn, context: &'static str) -> DbConnGuard {
+    DbConnGuard::new_without_checkpoint(conn, context)
 }
 
 #[cfg(test)]

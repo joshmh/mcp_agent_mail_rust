@@ -4794,6 +4794,7 @@ dependencies = [
  "tempfile",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "walkdir",
  "web-time",
 ]
