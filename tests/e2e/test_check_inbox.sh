@@ -7,7 +7,7 @@
 # - Rate limiting: Stamp-file-based check throttling
 # - Output modes: JSON vs human-readable (emoji)
 # - Template detection: Silent exit for placeholder values
-# - Error handling: Fail-safe for hooks (silent exit on errors)
+# - Error handling: Fail-safe exit code with visible did-not-run status
 # - Exit codes: 0 on success/skip, proper signal handling
 #
 # Artifacts (via e2e_lib.sh helpers):
@@ -265,7 +265,7 @@ mkdir -p "$RATE_LIMIT_PROJECT"
 
 e2e_case_banner "First check creates stamp file"
 e2e_mark_case_start "rate_limit_first"
-# Note: This will fail silently because there's no server, but should create the stamp file.
+# The read will report a connection failure, but it should still create the stamp file.
 run_check_inbox "rate_limit_first" --agent "RateLimitAgent" --project "$RATE_LIMIT_PROJECT" \
     --rate-limit 3600 --host "127.0.0.1" --port 65432
 e2e_assert_exit_code "first check exit code" "0" "$_EXIT_CODE"
@@ -289,7 +289,7 @@ e2e_mark_case_end "rate_limit_second"
 e2e_case_banner "Rate limit 0 disables rate limiting"
 e2e_mark_case_start "rate_limit_zero"
 run_check_inbox "rate_limit_zero" --agent "RateLimitAgent" --rate-limit 0 --host "127.0.0.1" --port 65432
-# Even with rate-limit 0, should still exit silently if server not available
+# Even with rate-limit 0, an unavailable server must keep the hook-safe exit code.
 e2e_assert_exit_code "rate-limit-0 exit code" "0" "$_EXIT_CODE"
 e2e_mark_case_end "rate_limit_zero"
 
@@ -333,7 +333,7 @@ if [ "$SEED_SUCCESS" = "1" ]; then
         --host "127.0.0.1" --port "$HTTP_PORT" --rate-limit 0 --json
     e2e_assert_exit_code "http json exit code" "0" "$_EXIT_CODE"
     # Validate JSON structure
-    if echo "$_STDOUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'agent' in d and 'unread_count' in d" 2>/dev/null; then
+    if echo "$_STDOUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['checked'] is True and 'agent' in d and d['unread_count'] > 0" 2>/dev/null; then
         e2e_pass "http json valid structure"
     else
         e2e_fail "http json invalid structure"
@@ -344,12 +344,28 @@ else
     e2e_skip "HTTP mode with messages tests (seeding failed - pre-existing bug in register_agent)"
 fi
 
-e2e_case_banner "HTTP mode with non-existent agent (silent exit)"
+e2e_rpc_call "seed_empty_agent" "$E2E_SERVER_URL" "register_agent" \
+    "{\"project_key\":\"${PROJECT_KEY}\",\"program\":\"test\",\"model\":\"test\",\"name\":\"SilverMeadow\"}" || true
+
+e2e_case_banner "HTTP mode reports a successful zero-message check"
+e2e_mark_case_start "http_zero_json"
+run_check_inbox "http_zero_json" --agent "SilverMeadow" --project "$PROJECT_KEY" \
+    --host "127.0.0.1" --port "$HTTP_PORT" --rate-limit 0 --json
+e2e_assert_exit_code "http zero json exit code" "0" "$_EXIT_CODE"
+if echo "$_STDOUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['checked'] is True and d['unread_count'] == 0" 2>/dev/null; then
+    e2e_pass "http zero json reports checked count"
+else
+    e2e_fail "http zero json did not report checked count"
+    echo "stdout: $_STDOUT"
+fi
+e2e_mark_case_end "http_zero_json"
+
+e2e_case_banner "HTTP mode with non-existent agent reports did-not-run"
 e2e_mark_case_start "http_no_agent"
 run_check_inbox "http_no_agent" --agent "GhostWolf" --project "$PROJECT_KEY" \
     --host "127.0.0.1" --port "$HTTP_PORT" --rate-limit 0
 e2e_assert_exit_code "http no agent exit code" "0" "$_EXIT_CODE"
-# Should exit silently (fail-safe for hooks)
+e2e_assert_contains "http no agent reports did-not-run" "$_STDOUT" "did not run"
 e2e_mark_case_end "http_no_agent"
 
 e2e_stop_server
@@ -404,7 +420,7 @@ if [ "$SEED_SUCCESS" = "1" ]; then
         --direct --rate-limit 0 --json
     e2e_assert_exit_code "direct json exit code" "0" "$_EXIT_CODE"
     # Validate JSON structure
-    if echo "$_STDOUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'agent' in d and 'unread_count' in d" 2>/dev/null; then
+    if echo "$_STDOUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['checked'] is True and 'agent' in d and d['unread_count'] > 0" 2>/dev/null; then
         e2e_pass "direct json valid structure"
     else
         e2e_fail "direct json invalid structure"
@@ -415,12 +431,12 @@ else
     e2e_skip "Direct mode with messages tests (seeding failed - pre-existing bug in register_agent)"
 fi
 
-e2e_case_banner "Direct mode with non-existent agent (silent exit)"
+e2e_case_banner "Direct mode with non-existent agent reports did-not-run"
 e2e_mark_case_start "direct_no_agent"
 run_check_inbox "direct_no_agent" --agent "PurpleFox" --project "$PROJECT_KEY" \
     --direct --rate-limit 0
 e2e_assert_exit_code "direct no agent exit code" "0" "$_EXIT_CODE"
-# Should exit silently
+e2e_assert_contains "direct no agent reports did-not-run" "$_STDOUT" "did not run"
 e2e_mark_case_end "direct_no_agent"
 
 unset DATABASE_URL STORAGE_ROOT
@@ -446,20 +462,21 @@ e2e_mark_case_end "no_agent_config"
 
 e2e_banner "Run 6: Error handling (fail-safe)"
 
-e2e_case_banner "Connection refused exits silently"
+e2e_case_banner "Connection refused reports did-not-run and exits successfully"
 e2e_mark_case_start "conn_refused"
 run_check_inbox "conn_refused" --agent "SilentBear" --project "/tmp/nonexistent" \
     --host "127.0.0.1" --port 65432 --rate-limit 0
 e2e_assert_exit_code "conn refused exit code" "0" "$_EXIT_CODE"
-# Should exit silently - fail-safe for hooks
+e2e_assert_contains "conn refused reports did-not-run" "$_STDOUT" "did not run"
 e2e_mark_case_end "conn_refused"
 
-e2e_case_banner "Invalid project path in direct mode exits silently"
+e2e_case_banner "Invalid project path in direct mode reports did-not-run"
 e2e_mark_case_start "direct_invalid_project"
 export DATABASE_URL="sqlite:////nonexistent/path/db.sqlite3"
 run_check_inbox "direct_invalid_project" --agent "QuietFrog" \
     --project "/nonexistent/project" --direct --rate-limit 0
 e2e_assert_exit_code "direct invalid project exit code" "0" "$_EXIT_CODE"
+e2e_assert_contains "direct invalid project reports did-not-run" "$_STDOUT" "did not run"
 unset DATABASE_URL
 e2e_mark_case_end "direct_invalid_project"
 

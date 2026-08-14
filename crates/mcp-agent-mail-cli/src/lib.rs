@@ -8146,7 +8146,7 @@ const fn check_inbox_should_use_daemon(direct: bool, daemon_reachable: bool) -> 
 /// Handle the check-inbox command.
 ///
 /// Checks the agent inbox for unread messages. Designed for git hooks and editor integrations.
-/// Exits silently on any error (fail-safe for hooks - never interrupt agent work).
+/// Reports read failures but still exits successfully so hooks never interrupt agent work.
 #[allow(clippy::too_many_arguments)]
 fn handle_check_inbox(
     agent: Option<String>,
@@ -8231,7 +8231,7 @@ fn handle_check_inbox(
             // The daemon went away between the reachability probe and the call.
             // Honor the co-located `--direct` intent with a direct SQLite read.
             let config = CheckInboxDirectConfig {
-                project_key,
+                project_key: project_key.clone(),
                 agent_name: agent_name.clone(),
                 limit: CHECK_INBOX_FETCH_LIMIT,
             };
@@ -8242,26 +8242,38 @@ fn handle_check_inbox(
     } else {
         // No daemon is listening — read SQLite directly (the fast co-located path).
         let config = CheckInboxDirectConfig {
-            project_key,
+            project_key: project_key.clone(),
             agent_name: agent_name.clone(),
             limit: CHECK_INBOX_FETCH_LIMIT,
         };
         check_inbox_direct(&config)
     };
 
-    // Handle result - exit silently on any error (fail-safe for hooks)
+    // Report failures while preserving the fail-safe exit code expected by hooks. A silent
+    // success is unsafe for callers that use this command as a mail-presence gate because it is
+    // indistinguishable from a successful check that found no unread messages.
     let result = match result {
         Ok(r) => r,
-        Err(_) => return Ok(()), // Fail silently
+        Err(error) => {
+            let output_data = serde_json::json!({
+                "checked": false,
+                "agent": agent_name,
+                "project": project_key,
+                "unread_count": serde_json::Value::Null,
+                "error": error.to_string(),
+            });
+            output::emit_output(&output_data, fmt, || {
+                ftui_runtime::ftui_println!(
+                    "⚠️  Inbox check did not run for {agent_name}: {error}"
+                );
+            });
+            return Ok(());
+        }
     };
-
-    // No messages - exit silently
-    if result.unread_count == 0 {
-        return Ok(());
-    }
 
     // Build output data for JSON/TOON
     let output_data = serde_json::json!({
+        "checked": true,
         "agent": agent_name,
         "unread_count": result.unread_count,
         "urgent_or_high_count": result.urgent_or_high_count,
@@ -8277,6 +8289,11 @@ fn handle_check_inbox(
     });
 
     output::emit_output(&output_data, fmt, || {
+        if result.unread_count == 0 {
+            ftui_runtime::ftui_println!("Inbox checked: 0 unread messages for {agent_name}.");
+            return;
+        }
+
         // Human-readable output with emoji
         ftui_runtime::ftui_println!();
         ftui_runtime::ftui_println!("📬 === INBOX REMINDER ===");
@@ -41150,6 +41167,7 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(payload["params"]["arguments"]["agent_name"], "BlueLake");
         assert_eq!(payload["params"]["arguments"]["limit"], 10);
         assert_eq!(payload["params"]["arguments"]["include_bodies"], false);
+        assert_eq!(payload["params"]["arguments"]["unread_only"], true);
         // GH#207: check-inbox is a non-consuming peek — it must always ask
         // the daemon's fetch_inbox NOT to mark the returned messages read.
         assert_eq!(payload["params"]["arguments"]["mark_read"], false);
@@ -75666,6 +75684,7 @@ fn build_fetch_inbox_jsonrpc_request(config: &CheckInboxRpcConfig) -> serde_json
                 "agent_name": config.agent_name,
                 "limit": config.limit,
                 "include_bodies": config.include_bodies,
+                "unread_only": true,
                 // check-inbox is a monitoring peek for hooks and editors; it
                 // must never consume unread state (GH#207).
                 "mark_read": false,
