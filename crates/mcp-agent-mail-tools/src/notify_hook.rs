@@ -98,8 +98,11 @@ fn spawn_one(
         .env("AM_NOTIFY_MESSAGE_ID", message_id.to_string())
         .env("AM_NOTIFY_IMPORTANCE", importance)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        // aud-axg: never inherit the daemon's stdout/stderr. The default
+        // transport is stdio JSON-RPC; a child's "coalesced ..." line
+        // corrupts the MCP stream.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     match cmd.spawn() {
         Ok(child) => {
             tracing::info!(
