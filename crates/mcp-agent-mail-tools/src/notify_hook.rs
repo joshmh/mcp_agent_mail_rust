@@ -17,6 +17,25 @@ use std::process::{Command, Stdio};
 /// Environment variable naming the golem actuator.
 pub const AM_NOTIFY_HOOK_ENV: &str = "AM_NOTIFY_HOOK";
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only hook path. `Some(None)` means "explicitly unset".
+    /// Avoids `std::env::set_var`, which is `unsafe` under Rust 2024 and
+    /// forbidden by this crate's `#![forbid(unsafe_code)]`.
+    static TEST_HOOK_PATH: std::cell::RefCell<Option<Option<std::ffi::OsString>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn notify_hook_path() -> Option<std::ffi::OsString> {
+    #[cfg(test)]
+    {
+        if let Some(overridden) = TEST_HOOK_PATH.with(|cell| cell.borrow().clone()) {
+            return overridden;
+        }
+    }
+    std::env::var_os(AM_NOTIFY_HOOK_ENV).filter(|value| !value.is_empty())
+}
+
 /// Spawn the notify hook once per unique recipient. Never blocks on idle-gate
 /// wait. Failures print and log; they do not undo the durable insert.
 pub fn spawn_after_insert<'a, I>(
@@ -28,9 +47,9 @@ pub fn spawn_after_insert<'a, I>(
 ) where
     I: IntoIterator<Item = &'a String>,
 {
-    let hook = match std::env::var_os(AM_NOTIFY_HOOK_ENV) {
-        Some(value) if !value.is_empty() => value,
-        _ => return,
+    let hook = match notify_hook_path() {
+        Some(value) => value,
+        None => return,
     };
     let hook_path = Path::new(&hook);
     if !hook_path.is_file() {
@@ -113,32 +132,35 @@ fn spawn_one(
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
     use std::thread;
     use std::time::Duration;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    fn with_hook_path<R>(path: Option<std::ffi::OsString>, f: impl FnOnce() -> R) -> R {
+        TEST_HOOK_PATH.with(|cell| {
+            *cell.borrow_mut() = Some(path);
+        });
+        let result = f();
+        TEST_HOOK_PATH.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+        result
+    }
 
     #[test]
     fn unset_hook_is_a_no_op() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: serialized by ENV_LOCK; this test process is single-threaded
-        // around the env mutation.
-        unsafe {
-            std::env::remove_var(AM_NOTIFY_HOOK_ENV);
-        }
-        spawn_after_insert(
-            "/data/projects/golem",
-            "golem",
-            1,
-            [&"OliveBluff".to_string()],
-            "normal",
-        );
+        with_hook_path(None, || {
+            spawn_after_insert(
+                "/data/projects/golem",
+                "golem",
+                1,
+                [&"OliveBluff".to_string()],
+                "normal",
+            );
+        });
     }
 
     #[test]
     fn configured_hook_is_spawned_once_per_unique_recipient() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         let hook = dir.path().join("hook.sh");
         let log = dir.path().join("hook.log");
@@ -157,18 +179,17 @@ mod tests {
             perms.set_mode(0o755);
             fs::set_permissions(&hook, perms).unwrap();
         }
-        unsafe {
-            std::env::set_var(AM_NOTIFY_HOOK_ENV, hook.as_os_str());
-        }
         let alice = "AliceSeat".to_string();
         let bob = "BobSeat".to_string();
-        spawn_after_insert(
-            "/data/projects/golem",
-            "golem",
-            42,
-            [&alice, &alice, &bob],
-            "high",
-        );
+        with_hook_path(Some(hook.as_os_str().to_os_string()), || {
+            spawn_after_insert(
+                "/data/projects/golem",
+                "golem",
+                42,
+                [&alice, &alice, &bob],
+                "high",
+            );
+        });
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let body = loop {
             if let Ok(text) = fs::read_to_string(&log) {
@@ -181,9 +202,6 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(20));
         };
-        unsafe {
-            std::env::remove_var(AM_NOTIFY_HOOK_ENV);
-        }
         let mut lines: Vec<_> = body.lines().collect();
         lines.sort_unstable();
         assert_eq!(
@@ -197,19 +215,14 @@ mod tests {
 
     #[test]
     fn missing_hook_path_does_not_panic() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::set_var(AM_NOTIFY_HOOK_ENV, "/no/such/am-notify-hook");
-        }
-        spawn_after_insert(
-            "/data/projects/golem",
-            "golem",
-            7,
-            [&"GhostSeat".to_string()],
-            "normal",
-        );
-        unsafe {
-            std::env::remove_var(AM_NOTIFY_HOOK_ENV);
-        }
+        with_hook_path(Some(std::ffi::OsString::from("/no/such/am-notify-hook")), || {
+            spawn_after_insert(
+                "/data/projects/golem",
+                "golem",
+                7,
+                [&"GhostSeat".to_string()],
+                "normal",
+            );
+        });
     }
 }

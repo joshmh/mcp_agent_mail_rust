@@ -4702,7 +4702,7 @@ mod tests {
                         &ctx,
                         project_key.clone(),
                         "BlueLake".to_string(),
-                        vec!["PhantomVale".to_string()],
+                        vec!["MistyCove".to_string()],
                         subject.to_string(),
                         "must not be stored".to_string(),
                         None,
@@ -4720,7 +4720,7 @@ mod tests {
                     )
                     .await
                     .expect_err("unknown recipient must fail closed");
-                    assert!(error.message.contains("PhantomVale"));
+                    assert!(error.message.contains("MistyCove"));
                     assert!(error.message.contains(&project_key));
                     assert!(error.message.contains("not registered"));
 
@@ -4756,7 +4756,7 @@ mod tests {
                         project_key.clone(),
                         "codex-cli".to_string(),
                         "gpt-5".to_string(),
-                        Some("PhantomVale".to_string()),
+                        Some("MistyCove".to_string()),
                         Some("explicit first registration".to_string()),
                         Some("auto".to_string()),
                         None,
@@ -4769,7 +4769,7 @@ mod tests {
                         &ctx,
                         project_key,
                         "BlueLake".to_string(),
-                        vec!["PhantomVale".to_string()],
+                        vec!["MistyCove".to_string()],
                         "registered recipient succeeds".to_string(),
                         "stored after explicit registration".to_string(),
                         None,
