@@ -2511,6 +2511,16 @@ effective_free_bytes={free}"
                 }
             }
         }
+        // Event-driven doorbell (aud-mail-aware-pings-zio Stage 2). Fire-and-
+        // forget: the golem hook debounce + idle-gate, this process must not
+        // wait. Unset AM_NOTIFY_HOOK is a no-op; a configured dead hook logs.
+        crate::notify_hook::spawn_after_insert(
+            &project.human_key,
+            &project.slug,
+            message_id,
+            notified.iter(),
+            &message.importance,
+        );
 
         // Write message bundle to git archive (best-effort)
         {
@@ -3467,6 +3477,13 @@ effective_free_bytes={free}"
                 }
             }
         }
+        crate::notify_hook::spawn_after_insert(
+            &project.human_key,
+            &project.slug,
+            reply_id,
+            notified.iter(),
+            &reply.importance,
+        );
 
         // Write reply message bundle to git archive (best-effort)
         {
