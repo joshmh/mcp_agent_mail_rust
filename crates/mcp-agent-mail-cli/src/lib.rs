@@ -35259,10 +35259,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                     if placeholder_candidates
                         && let Some(arr) = payload.as_array_mut()
                     {
-                        arr.retain(|item| {
-                            item.get("program").and_then(|v| v.as_str()) == Some("unknown")
-                                && item.get("model").and_then(|v| v.as_str()) == Some("unknown")
-                        });
+                        arr.retain(mcp_agent_mail_db::json_is_placeholder_stub_candidate);
                     }
                     render_agent_list_payload(&payload, fmt);
                     return Ok(());
@@ -35348,7 +35345,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                         obj.insert(
                             "heuristic".to_string(),
                             serde_json::Value::String(
-                                "program=unknown AND model=unknown AND empty task; not provenance"
+                                "program=unknown AND model=unknown AND empty task AND attachments_policy=auto AND contact_policy=auto; not provenance"
                                     .to_string(),
                             ),
                         );

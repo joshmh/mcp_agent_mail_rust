@@ -2590,7 +2590,7 @@ pub fn cleanup_pane_identities(
 const LIST_AGENTS_DEFAULT_MAX: usize = 250;
 
 #[tool(
-    description = "List registered agents in a project, most-recently-active first.\n\nReturns agent name, role (program), model, task description, registration time (inception_ts), and last seen (last_active_ts).\n\nThe result is bounded to avoid blowing the calling agent's context window on long-lived projects that accumulate agents across many short-lived swarms: at most `limit` agents (default 250) are returned, optionally restricted to those active within `active_within_days`.\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\nlimit : Optional[int]\n    Maximum number of agents to return (most-recently-active first). Defaults to 250; values above 250 are clamped to 250.\nactive_within_days : Optional[int]\n    If provided, only return agents whose last_active_ts is within this many days. Omit to include all agents (subject to limit).\n\nReturns\n-------\nstr (JSON)\n    Array of agent objects with fields: name, program, model, task_description, inception_ts, last_active_ts, contact_policy. Ordered by last_active_ts descending."
+    description = "List registered agents in a project, most-recently-active first.\n\nReturns agent name, role (program), model, task description, registration time (inception_ts), and last seen (last_active_ts).\n\nThe result is bounded to avoid blowing the calling agent's context window on long-lived projects that accumulate agents across many short-lived swarms: at most `limit` agents (default 250) are returned, optionally restricted to those active within `active_within_days`.\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\nlimit : Optional[int]\n    Maximum number of agents to return (most-recently-active first). Defaults to 250; values above 250 are clamped to 250.\nactive_within_days : Optional[int]\n    If provided, only return agents whose last_active_ts is within this many days. Omit to include all agents (subject to limit).\n\nReturns\n-------\nstr (JSON)\n    Array of agent objects with fields: name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy. Ordered by last_active_ts descending."
 )]
 pub async fn list_agents(
     ctx: &McpContext,
@@ -2639,6 +2639,7 @@ pub async fn list_agents(
                 "task_description": a.task_description,
                 "inception_ts": micros_to_iso(a.inception_ts),
                 "last_active_ts": micros_to_iso(a.last_active_ts),
+                "attachments_policy": a.attachments_policy,
                 "contact_policy": a.contact_policy,
             })
         })
@@ -2656,6 +2657,29 @@ mod tests {
     use fastmcp::McpContext;
     use mcp_agent_mail_core::config::with_process_env_overrides_for_test;
     use std::path::PathBuf;
+
+    #[test]
+    fn list_agents_json_placeholder_filter_uses_five_fields() {
+        let stub = serde_json::json!({
+            "program": "unknown",
+            "model": "unknown",
+            "task_description": "",
+            "attachments_policy": "auto",
+            "contact_policy": "auto",
+        });
+        assert!(mcp_agent_mail_db::json_is_placeholder_stub_candidate(&stub));
+
+        let two_field_only = serde_json::json!({
+            "program": "unknown",
+            "model": "unknown",
+            "task_description": "real task",
+            "attachments_policy": "auto",
+            "contact_policy": "auto",
+        });
+        assert!(!mcp_agent_mail_db::json_is_placeholder_stub_candidate(
+            &two_field_only
+        ));
+    }
 
     /// All-green decomposed verdicts, for response-serialization tests that
     /// don't exercise the rollup logic.

@@ -219,12 +219,45 @@ impl AgentRow {
     /// can use the same field values, so a match is a *candidate*, not a proof.
     #[must_use]
     pub fn is_placeholder_stub_candidate(&self) -> bool {
-        self.program.trim() == "unknown"
-            && self.model.trim() == "unknown"
-            && self.task_description.trim().is_empty()
-            && self.attachments_policy.trim() == "auto"
-            && self.contact_policy.trim() == "auto"
+        is_placeholder_stub_candidate_fields(
+            &self.program,
+            &self.model,
+            &self.task_description,
+            &self.attachments_policy,
+            &self.contact_policy,
+        )
     }
+}
+
+/// Shared 5-field stub heuristic used by `AgentRow` and by JSON list
+/// payloads (`am agents list --placeholder-candidates` server-bridge).
+#[must_use]
+pub fn is_placeholder_stub_candidate_fields(
+    program: &str,
+    model: &str,
+    task_description: &str,
+    attachments_policy: &str,
+    contact_policy: &str,
+) -> bool {
+    program.trim() == "unknown"
+        && model.trim() == "unknown"
+        && task_description.trim().is_empty()
+        && attachments_policy.trim() == "auto"
+        && contact_policy.trim() == "auto"
+}
+
+/// Apply [`is_placeholder_stub_candidate_fields`] to a `list_agents` JSON
+/// object. Missing keys are treated as empty / not `"auto"`.
+#[must_use]
+pub fn json_is_placeholder_stub_candidate(item: &serde_json::Value) -> bool {
+    let field = |key: &str| item.get(key).and_then(serde_json::Value::as_str).unwrap_or("");
+    is_placeholder_stub_candidate_fields(
+        field("program"),
+        field("model"),
+        field("task_description"),
+        field("attachments_policy"),
+        field("contact_policy"),
+    )
 }
 
 // =============================================================================
@@ -594,6 +627,35 @@ mod tests {
         assert!(stub.is_placeholder_stub_candidate());
         stub.program = "codex-cli".into();
         assert!(!stub.is_placeholder_stub_candidate());
+    }
+
+    #[test]
+    fn json_placeholder_stub_candidate_matches_row_heuristic() {
+        let stub = serde_json::json!({
+            "program": "unknown",
+            "model": "unknown",
+            "task_description": "",
+            "attachments_policy": "auto",
+            "contact_policy": "auto",
+        });
+        assert!(json_is_placeholder_stub_candidate(&stub));
+
+        let two_field_only = serde_json::json!({
+            "program": "unknown",
+            "model": "unknown",
+            "task_description": "real task",
+            "attachments_policy": "auto",
+            "contact_policy": "auto",
+        });
+        assert!(!json_is_placeholder_stub_candidate(&two_field_only));
+
+        let missing_policy = serde_json::json!({
+            "program": "unknown",
+            "model": "unknown",
+            "task_description": "",
+            "contact_policy": "auto",
+        });
+        assert!(!json_is_placeholder_stub_candidate(&missing_policy));
     }
 
     #[test]
