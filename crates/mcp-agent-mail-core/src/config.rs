@@ -351,6 +351,13 @@ pub struct Config {
     // Contact & Messaging
     pub contact_enforcement_enabled: bool,
     pub contact_auto_ttl_seconds: u64,
+    /// Legacy opt-in for creating unknown recipients during `send_message`.
+    ///
+    /// This must default to false: a misspelled recipient must not create an
+    /// `unknown`/`unknown` identity and a phantom mailbox. New identities are
+    /// created through the explicit registration tools instead. Historical
+    /// stubs cannot be identified safely because agent rows record no creation
+    /// provenance and `unknown` remains a valid caller-supplied field value.
     pub messaging_auto_register_recipients: bool,
     pub messaging_auto_handshake_on_block: bool,
     /// Opt-in fail-closed profile for `send_message`.
@@ -1498,7 +1505,7 @@ impl Default for Config {
             // Contact & Messaging
             contact_enforcement_enabled: true,
             contact_auto_ttl_seconds: 86400, // 24 hours
-            messaging_auto_register_recipients: true,
+            messaging_auto_register_recipients: false,
             messaging_auto_handshake_on_block: true,
             messaging_fail_closed_send_profile: false,
 
@@ -3773,9 +3780,16 @@ mod tests {
             "sqlite+aiosqlite:///./storage.sqlite3".to_string()
         );
         assert!(config.contact_enforcement_enabled);
+        assert!(!config.messaging_auto_register_recipients);
         assert!(!config.messaging_fail_closed_send_profile);
         assert!(!config.allow_absolute_attachment_paths);
         assert!(!config.allow_ephemeral_projects_in_default_storage);
+    }
+
+    #[test]
+    fn recipient_auto_registration_is_opt_in_and_env_configurable() {
+        let _env = TestEnvOverrideGuard::set(&[("MESSAGING_AUTO_REGISTER_RECIPIENTS", "true")]);
+        assert!(Config::from_env().messaging_auto_register_recipients);
     }
 
     #[test]

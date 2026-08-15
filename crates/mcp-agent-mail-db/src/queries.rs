@@ -5035,6 +5035,57 @@ pub async fn list_agents(
     list_agents_bounded(cx, pool, project_id, None, None).await
 }
 
+/// Read-only heuristic scan for `send_message` auto-register stubs.
+///
+/// Matches the field shape `register_agent(..., "unknown", "unknown", None)`
+/// used by `resolve_or_register_agent`. Rows are *candidates*: the schema
+/// has no provenance bit, so an explicit registration with those values
+/// would also match. `project_key` is the project's `human_key`.
+pub async fn list_placeholder_stub_candidates(
+    cx: &Cx,
+    pool: &DbPool,
+) -> Outcome<Vec<(String, AgentRow)>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    let sql = "SELECT a.id, a.project_id, a.name, a.program, a.model, a.task_description, \
+               a.inception_ts, a.last_active_ts, a.attachments_policy, a.contact_policy, \
+               a.reaper_exempt, a.registration_token, p.human_key \
+               FROM agents AS a \
+               JOIN projects AS p ON p.id = a.project_id \
+               WHERE a.program = 'unknown' AND a.model = 'unknown' \
+               ORDER BY p.human_key, a.name";
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &[]).await) {
+        Outcome::Ok(rows) => {
+            let get_string = |row: &SqlRow, index: usize| {
+                row.get(index)
+                    .and_then(|value| match value {
+                        Value::Text(value) => Some(value.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            };
+            Outcome::Ok(
+                rows.iter()
+                    .map(|row| {
+                        let agent = decode_agent_row_indexed(row);
+                        let project_key = get_string(row, 12);
+                        (project_key, agent)
+                    })
+                    .filter(|(_, agent)| agent.is_placeholder_stub_candidate())
+                    .collect(),
+            )
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
 /// Load the bounded, recent agent population needed by the ATC operator.
 ///
 /// This deliberately performs one joined query for the entire mailbox. The

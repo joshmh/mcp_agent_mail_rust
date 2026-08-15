@@ -211,6 +211,20 @@ impl AgentRow {
     pub fn touch(&mut self) {
         self.last_active_ts = now_micros();
     }
+
+    /// Heuristic for `send_message` auto-register stubs (`program`/`model` =
+    /// `"unknown"`, empty task, default policies).
+    ///
+    /// This is **not** stored provenance. An explicit `register_agent` call
+    /// can use the same field values, so a match is a *candidate*, not a proof.
+    #[must_use]
+    pub fn is_placeholder_stub_candidate(&self) -> bool {
+        self.program.trim() == "unknown"
+            && self.model.trim() == "unknown"
+            && self.task_description.trim().is_empty()
+            && self.attachments_policy.trim() == "auto"
+            && self.contact_policy.trim() == "auto"
+    }
 }
 
 // =============================================================================
@@ -571,6 +585,15 @@ mod tests {
         assert_eq!(agent.program, "claude-code");
         assert_eq!(agent.model, "opus-4.6");
         assert!(agent.task_description.is_empty());
+        assert!(!agent.is_placeholder_stub_candidate());
+    }
+
+    #[test]
+    fn placeholder_stub_candidate_matches_auto_register_shape_only() {
+        let mut stub = AgentRow::new(1, "GhostHarbor".into(), "unknown".into(), "unknown".into());
+        assert!(stub.is_placeholder_stub_candidate());
+        stub.program = "codex-cli".into();
+        assert!(!stub.is_placeholder_stub_candidate());
     }
 
     #[test]

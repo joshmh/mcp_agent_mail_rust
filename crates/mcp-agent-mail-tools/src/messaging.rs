@@ -520,10 +520,9 @@ async fn resolve_or_register_agent(
                 // Proof gate (fail-closed): auto-registering an unknown recipient
                 // here cannot carry a signed `registration_proof` bundle, so when
                 // the gate is enabled we refuse instead of minting an unproven
-                // identity (program/model="unknown"). Without this, `send_message`
-                // to a non-existent recipient was a side door around the gate.
-                // Disabled gate = no-op, so default auto-register behavior is
-                // preserved exactly.
+                // identity (program/model="unknown"). Auto-register itself is
+                // now opt-in (`MESSAGING_AUTO_REGISTER_RECIPIENTS`); the default
+                // is to surface RECIPIENT_NOT_FOUND and write nothing.
                 crate::proof_gate::reject_auto_registration_if_enabled(
                     "send_message auto-registration of recipient",
                 )?;
@@ -1930,7 +1929,8 @@ effective_free_bytes={free}"
         ));
     }
 
-    // Resolve all recipients (to, cc, bcc) with optional auto-registration
+    // Resolve all recipients (to, cc, bcc). Unknown names fail closed by
+    // default; legacy auto-registration is an explicit configuration opt-in.
     let total_recip = to.len() + cc_list.len() + bcc_list.len();
     let mut all_recipients: SmallVec<[(i64, String); 8]> = SmallVec::with_capacity(total_recip);
     let mut resolved_to: SmallVec<[String; 4]> = SmallVec::with_capacity(to.len());
@@ -4647,6 +4647,286 @@ mod tests {
             Outcome::Ok(agent) => agent,
             other => panic!("register_agent({name}, None) failed: {other:?}"),
         }
+    }
+
+    #[test]
+    fn send_message_rejects_unknown_recipient_without_writes_then_allows_registered_recipient() {
+        let _lock = MESSAGING_THREAD_ID_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("unknown recipient test tempdir");
+        let storage_root = temp.path().join("storage");
+        let database_path = temp.path().join("storage.sqlite3");
+        let database_url = format!("sqlite:///{}", database_path.display());
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("CONTACT_ENFORCEMENT_ENABLED", "0"),
+                ("MESSAGING_AUTO_REGISTER_RECIPIENTS", "0"),
+            ],
+            || {
+                Config::reset_cached();
+                let cx = Cx::for_testing();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let project_key = format!(
+                        "/data/projects/unknown-recipient-{}",
+                        mcp_agent_mail_db::now_micros()
+                    );
+                    crate::ensure_project(&ctx, project_key.clone(), None)
+                        .await
+                        .expect("ensure project");
+                    crate::register_agent(
+                        &ctx,
+                        project_key.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some("BlueLake".to_string()),
+                        Some("sender".to_string()),
+                        Some("auto".to_string()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("register sender");
+
+                    let subject = "aud-piz phantom recipient regression";
+                    let error = send_message(
+                        &ctx,
+                        project_key.clone(),
+                        "BlueLake".to_string(),
+                        vec!["PhantomVale".to_string()],
+                        subject.to_string(),
+                        "must not be stored".to_string(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect_err("unknown recipient must fail closed");
+                    assert!(error.message.contains("PhantomVale"));
+                    assert!(error.message.contains(&project_key));
+                    assert!(error.message.contains("not registered"));
+
+                    let pool = get_db_pool().expect("get test pool");
+                    let project = db_outcome_to_mcp_result(
+                        queries::get_project_by_human_key(&cx, &pool, &project_key).await,
+                    )
+                    .expect("load project");
+                    let project_id = project.id.expect("project id");
+                    let agents = queries::list_agents(&cx, &pool, project_id)
+                        .await
+                        .into_result()
+                        .expect("list agents");
+                    assert_eq!(
+                        agents
+                            .iter()
+                            .map(|agent| agent.name.as_str())
+                            .collect::<Vec<_>>(),
+                        vec!["BlueLake"],
+                        "failed send must not create a stub recipient"
+                    );
+                    let messages = queries::search_messages(&cx, &pool, project_id, subject, 10)
+                        .await
+                        .into_result()
+                        .expect("search messages");
+                    assert!(
+                        messages.is_empty(),
+                        "failed send must not create a message or recipient delivery row"
+                    );
+
+                    crate::register_agent(
+                        &ctx,
+                        project_key.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some("PhantomVale".to_string()),
+                        Some("explicit first registration".to_string()),
+                        Some("auto".to_string()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("explicit first-time registration remains supported");
+                    let sent = send_message(
+                        &ctx,
+                        project_key,
+                        "BlueLake".to_string(),
+                        vec!["PhantomVale".to_string()],
+                        "registered recipient succeeds".to_string(),
+                        "stored after explicit registration".to_string(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("registered recipient send succeeds");
+                    let sent: serde_json::Value =
+                        serde_json::from_str(&sent).expect("parse send response");
+                    assert_eq!(sent["count"].as_u64(), Some(1));
+                });
+                Config::reset_cached();
+            },
+        );
+    }
+
+    #[test]
+    fn send_message_does_not_mint_a_stub_when_the_name_exists_in_another_project() {
+        let _lock = MESSAGING_THREAD_ID_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("cross-project stub tempdir");
+        let storage_root = temp.path().join("storage");
+        let database_path = temp.path().join("storage.sqlite3");
+        let database_url = format!("sqlite:///{}", database_path.display());
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("CONTACT_ENFORCEMENT_ENABLED", "0"),
+                ("MESSAGING_AUTO_REGISTER_RECIPIENTS", "0"),
+            ],
+            || {
+                Config::reset_cached();
+                let cx = Cx::for_testing();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let project_a = format!(
+                        "/data/projects/cross-a-{}",
+                        mcp_agent_mail_db::now_micros()
+                    );
+                    let project_b = format!(
+                        "/data/projects/cross-b-{}",
+                        mcp_agent_mail_db::now_micros()
+                    );
+                    crate::ensure_project(&ctx, project_a.clone(), None)
+                        .await
+                        .expect("ensure A");
+                    crate::ensure_project(&ctx, project_b.clone(), None)
+                        .await
+                        .expect("ensure B");
+                    crate::register_agent(
+                        &ctx,
+                        project_a.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some("BlueLake".to_string()),
+                        Some("sender in A".to_string()),
+                        Some("auto".to_string()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("register sender in A");
+                    crate::register_agent(
+                        &ctx,
+                        project_b.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some("OliveBluff".to_string()),
+                        Some("real dest in B".to_string()),
+                        Some("auto".to_string()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("register dest in B");
+
+                    let error = send_message(
+                        &ctx,
+                        project_a.clone(),
+                        "BlueLake".to_string(),
+                        vec!["OliveBluff".to_string()],
+                        "wrong project".to_string(),
+                        "must not create a stub in A".to_string(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect_err("name registered in B must not deliver in A");
+                    assert!(error.message.contains("OliveBluff"));
+                    assert!(error.message.contains(&project_a));
+                    assert!(error.message.contains("not registered"));
+
+                    let pool = get_db_pool().expect("pool");
+                    let project = db_outcome_to_mcp_result(
+                        queries::get_project_by_human_key(&cx, &pool, &project_a).await,
+                    )
+                    .expect("load A");
+                    let agents = queries::list_agents(&cx, &pool, project.id.expect("id"))
+                        .await
+                        .into_result()
+                        .expect("list A");
+                    assert_eq!(
+                        agents
+                            .iter()
+                            .map(|agent| agent.name.as_str())
+                            .collect::<Vec<_>>(),
+                        vec!["BlueLake"]
+                    );
+
+                    crate::request_contact(
+                        &ctx,
+                        project_a,
+                        "BlueLake".to_string(),
+                        "OliveBluff".to_string(),
+                        Some(project_b),
+                        Some("explicit dest project".to_string()),
+                        Some(600),
+                        Some(false),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("explicit to_project against a registered dest succeeds");
+                });
+                Config::reset_cached();
+            },
+        );
     }
 
     #[test]

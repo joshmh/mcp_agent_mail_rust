@@ -493,7 +493,7 @@ fn enforce_with_config(
 /// Two tool paths mint identities implicitly:
 ///
 /// - `send_message` to a not-yet-registered recipient (when
-///   `messaging_auto_register_recipients` is on, the default), via
+///   the legacy `messaging_auto_register_recipients` opt-in is on), via
 ///   `messaging::resolve_or_register_agent`, and
 /// - `request_contact` with a not-yet-registered `from_agent` (when
 ///   `register_if_missing` is on, the default), via
@@ -507,8 +507,8 @@ fn enforce_with_config(
 /// unaffected: this guard only runs on the create-on-missing branch, so normal
 /// messaging/contact traffic between registered agents keeps working.
 ///
-/// When the gate is disabled (the default) this is a no-op returning `Ok(())`,
-/// so auto-registration behaves exactly as before.
+/// When the gate is disabled (the default) this is a no-op returning `Ok(())`.
+/// Recipient auto-registration remains disabled unless separately opted in.
 ///
 /// # Errors
 ///

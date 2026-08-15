@@ -2916,6 +2916,23 @@ pub enum AgentsCommand {
         /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Restrict to heuristic auto-register stub candidates
+        /// (`program=unknown` and `model=unknown`). Not a provenance bit.
+        #[arg(long)]
+        placeholder_candidates: bool,
+    },
+    /// Read-only heuristic scan for auto-register stub recipients (aud-piz).
+    ///
+    /// Matches the field shape minted when `MESSAGING_AUTO_REGISTER_RECIPIENTS`
+    /// was on. Explicit registrations that used program/model `unknown` will
+    /// also appear — treat as candidates, not proof.
+    Stubs {
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Show details for a specific agent.
     Show {
@@ -3473,6 +3490,7 @@ fn agents_command_is_read_only(action: &AgentsCommand) -> bool {
             | AgentsCommand::Show { .. }
             | AgentsCommand::Detect { .. }
             | AgentsCommand::ResolvePane { .. }
+            | AgentsCommand::Stubs { .. }
     )
 }
 
@@ -35224,6 +35242,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             project_key,
             format,
             json,
+            placeholder_candidates,
         } => {
             let project_key = resolve_agents_project_key(project_key, positional_project)?;
             let fmt = output::CliOutputFormat::resolve(format, json);
@@ -35236,7 +35255,15 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             .await
             {
                 ServerToolCall::Success(result) => {
-                    let payload = coerce_tool_result_json_or_error("list_agents", result)?;
+                    let mut payload = coerce_tool_result_json_or_error("list_agents", result)?;
+                    if placeholder_candidates
+                        && let Some(arr) = payload.as_array_mut()
+                    {
+                        arr.retain(|item| {
+                            item.get("program").and_then(|v| v.as_str()) == Some("unknown")
+                                && item.get("model").and_then(|v| v.as_str()) == Some("unknown")
+                        });
+                    }
                     render_agent_list_payload(&payload, fmt);
                     return Ok(());
                 }
@@ -35276,7 +35303,63 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                     }
                 };
 
-            let data: Vec<serde_json::Value> = agents.iter().map(agent_row_to_json).collect();
+            let data: Vec<serde_json::Value> = agents
+                .iter()
+                .filter(|agent| {
+                    !placeholder_candidates || agent.is_placeholder_stub_candidate()
+                })
+                .map(agent_row_to_json)
+                .collect();
+            render_agent_list_payload(&serde_json::Value::Array(data), fmt);
+            Ok(())
+        }
+
+        AgentsCommand::Stubs { format, json } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
+            let rows = match mcp_agent_mail_db::queries::list_placeholder_stub_candidates(
+                &cx, &ctx.pool,
+            )
+            .await
+            {
+                asupersync::Outcome::Ok(rows) => rows,
+                asupersync::Outcome::Err(e) => {
+                    return Err(CliError::Other(format!(
+                        "list_placeholder_stub_candidates failed: {e}"
+                    )));
+                }
+                asupersync::Outcome::Cancelled(_) => {
+                    return Err(CliError::Other("request cancelled".into()));
+                }
+                asupersync::Outcome::Panicked(p) => {
+                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
+                }
+            };
+            let data: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|(project_key, agent)| {
+                    let mut value = agent_row_to_json(&agent);
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert(
+                            "project_key".to_string(),
+                            serde_json::Value::String(project_key),
+                        );
+                        obj.insert(
+                            "heuristic".to_string(),
+                            serde_json::Value::String(
+                                "program=unknown AND model=unknown AND empty task; not provenance"
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                    value
+                })
+                .collect();
+            eprintln!(
+                "am agents stubs: {} candidate(s). Heuristic only — schema has no stub provenance.",
+                data.len()
+            );
             render_agent_list_payload(&serde_json::Value::Array(data), fmt);
             Ok(())
         }
@@ -36613,8 +36696,8 @@ mod mail_server_cli_bridge_tests {
         build_server_list_agents_arguments, build_server_macro_start_session_arguments,
         build_server_register_agent_arguments, build_server_reply_message_arguments,
         build_server_send_message_arguments, build_server_whois_arguments,
-        classify_server_tool_call, coerce_tool_result_json, coerce_tool_result_json_or_error,
-        create_pending_send_artifact, ensure_message_in_project,
+        call_send_message_tool_locally, classify_server_tool_call, coerce_tool_result_json,
+        coerce_tool_result_json_or_error, create_pending_send_artifact, ensure_message_in_project,
         fetch_inbox_server_rejection_allows_local_fallback, get_blocking_http_request,
         is_resource_busy_cli_error, load_pending_send_artifact, load_pending_send_receipt,
         load_sender_identity_token, mail_server_rejection_allows_local_fallback,
@@ -36629,6 +36712,8 @@ mod mail_server_cli_bridge_tests {
         validate_pending_send_artifact, validate_pending_send_receipt, write_pending_send_receipt,
     };
     use mcp_agent_mail_core::config::Config;
+
+    static UNKNOWN_RECIPIENT_CLI_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn send_message_server_arguments_omit_absent_optional_fields() {
@@ -36688,6 +36773,82 @@ mod mail_server_cli_bridge_tests {
             Some(""),
         );
         assert!(!args_empty.as_object().unwrap().contains_key("sender_token"));
+    }
+
+    #[test]
+    fn cli_local_send_rejects_unknown_recipient_and_does_not_queue_it() {
+        let _lock = UNKNOWN_RECIPIENT_CLI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("CLI unknown recipient tempdir");
+        let storage_root = temp.path().join("storage");
+        let database_path = temp.path().join("storage.sqlite3");
+        let database_url = format!("sqlite:///{}", database_path.display());
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("CONTACT_ENFORCEMENT_ENABLED", "0"),
+                ("MESSAGING_AUTO_REGISTER_RECIPIENTS", "0"),
+            ],
+            || {
+                Config::reset_cached();
+                let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build CLI unknown recipient runtime");
+                runtime.block_on(async {
+                    let ctx = fastmcp::prelude::McpContext::new(asupersync::Cx::for_testing(), 1);
+                    let project_key = format!(
+                        "/data/projects/cli-unknown-recipient-{}",
+                        mcp_agent_mail_db::now_micros()
+                    );
+                    mcp_agent_mail_tools::ensure_project(&ctx, project_key.clone(), None)
+                        .await
+                        .expect("ensure CLI test project");
+                    mcp_agent_mail_tools::register_agent(
+                        &ctx,
+                        project_key.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some("BlueLake".to_string()),
+                        Some("CLI sender".to_string()),
+                        Some("auto".to_string()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("register CLI sender");
+
+                    let recipient = "TypoHarbor".to_string();
+                    let error = call_send_message_tool_locally(
+                        &project_key,
+                        "BlueLake",
+                        std::slice::from_ref(&recipient),
+                        "aud-piz CLI regression",
+                        "must not be delivered",
+                        None,
+                        "normal",
+                        false,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect_err("CLI local bridge must reject an unknown recipient");
+                    let message = error.to_string();
+                    assert!(message.contains("TypoHarbor"));
+                    assert!(message.contains(&project_key));
+                    assert!(message.contains("not registered"));
+                    assert!(
+                        pending_send_failure_from_error(&error).is_none(),
+                        "a recipient typo is a permanent validation error, not a queued outage send"
+                    );
+                });
+                Config::reset_cached();
+            },
+        );
     }
 
     // ---- #147: mail send sender-token UX ----
@@ -59155,12 +59316,14 @@ startup_timeout_sec = 42
                         project_key,
                         format,
                         json,
+                        placeholder_candidates,
                     },
             } => {
                 assert_eq!(project_key.as_deref(), Some("my-proj"));
                 assert_eq!(positional_project, None);
                 assert_eq!(format, Some(output::CliOutputFormat::Toon));
                 assert!(!json);
+                assert!(!placeholder_candidates);
             }
             other => panic!("unexpected command: {other:?}"),
         }
