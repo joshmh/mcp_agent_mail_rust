@@ -2947,26 +2947,6 @@ effective_free_bytes={free}"
         convert_images.unwrap_or(config.convert_images)
     };
 
-    let (final_body, all_attachment_meta, all_attachment_rel_paths) = process_message_attachments(
-        config,
-        &project.slug,
-        &project.human_key,
-        Path::new(&project.human_key),
-        &subject,
-        &body_md,
-        attachment_paths.as_deref(),
-        do_convert,
-        embed_policy,
-    )?;
-
-    // Serialize processed attachment metadata as JSON array
-    let attachments_json = serde_json::to_string(&all_attachment_meta).unwrap_or_else(|e| {
-        tracing::error!(
-            "attachment metadata serialization failed, falling back to empty array: {e}"
-        );
-        "[]".to_string()
-    });
-
     // Subject and total size limits (including attachments) are already
     // enforced by validate_message_size_limits above.
 
@@ -2986,7 +2966,10 @@ effective_free_bytes={free}"
         ));
     }
 
-    // Resolve all recipients with auto-registration and deduplication
+    // Resolve all recipients (to, cc, bcc). Unknown names fail closed by
+    // default; legacy auto-registration is an explicit configuration opt-in.
+    // Must run before process_message_attachments so a RECIPIENT_NOT_FOUND
+    // reply does not leave orphaned files in the project archive (aud-g4l).
     let total_recip = to_names.len() + cc_names.len() + bcc_names.len();
     let mut all_recipients: SmallVec<[(i64, String); 8]> = SmallVec::with_capacity(total_recip);
     let mut resolved_to: SmallVec<[String; 4]> = SmallVec::with_capacity(to_names.len());
@@ -3342,6 +3325,26 @@ effective_free_bytes={free}"
             ));
         }
     }
+
+    let (final_body, all_attachment_meta, all_attachment_rel_paths) = process_message_attachments(
+        config,
+        &project.slug,
+        &project.human_key,
+        Path::new(&project.human_key),
+        &subject,
+        &body_md,
+        attachment_paths.as_deref(),
+        do_convert,
+        embed_policy,
+    )?;
+
+    // Serialize processed attachment metadata as JSON array
+    let attachments_json = serde_json::to_string(&all_attachment_meta).unwrap_or_else(|e| {
+        tracing::error!(
+            "attachment metadata serialization failed, falling back to empty array: {e}"
+        );
+        "[]".to_string()
+    });
 
     // Create reply message + recipients in a single DB transaction
     let recipient_refs: SmallVec<[(i64, &str); 8]> = all_recipients
@@ -4790,6 +4793,133 @@ mod tests {
                     let sent: serde_json::Value =
                         serde_json::from_str(&sent).expect("parse send response");
                     assert_eq!(sent["count"].as_u64(), Some(1));
+                });
+                Config::reset_cached();
+            },
+        );
+    }
+
+    #[test]
+    fn reply_message_rejects_unknown_recipient_without_writing_attachments() {
+        let _lock = MESSAGING_THREAD_ID_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("reply orphan attachment tempdir");
+        let storage_root = temp.path().join("storage");
+        let database_path = temp.path().join("storage.sqlite3");
+        let database_url = format!("sqlite:///{}", database_path.display());
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+        let attachment = temp.path().join("orphan-probe.txt");
+        std::fs::write(&attachment, b"must not land in the archive").expect("write attachment");
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("CONTACT_ENFORCEMENT_ENABLED", "0"),
+                ("MESSAGING_AUTO_REGISTER_RECIPIENTS", "0"),
+            ],
+            || {
+                Config::reset_cached();
+                let cx = Cx::for_testing();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let project_key = format!(
+                        "/data/projects/reply-orphan-{}",
+                        mcp_agent_mail_db::now_micros()
+                    );
+                    crate::ensure_project(&ctx, project_key.clone(), None)
+                        .await
+                        .expect("ensure project");
+                    crate::register_agent(
+                        &ctx,
+                        project_key.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some("BlueLake".to_string()),
+                        Some("sender".to_string()),
+                        Some("auto".to_string()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("register sender");
+
+                    let sent = send_message(
+                        &ctx,
+                        project_key.clone(),
+                        "BlueLake".to_string(),
+                        vec!["BlueLake".to_string()],
+                        "parent for orphan-attachment reply".to_string(),
+                        "parent body".to_string(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("parent send");
+                    let sent: serde_json::Value =
+                        serde_json::from_str(&sent).expect("parse send response");
+                    let message_id = sent["deliveries"][0]["payload"]["id"]
+                        .as_i64()
+                        .expect("parent message id");
+
+                    let error = reply_message(
+                        &ctx,
+                        project_key.clone(),
+                        message_id,
+                        "BlueLake".to_string(),
+                        "reply must not store this".to_string(),
+                        Some(vec!["MistyCove".to_string()]),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(vec![attachment.to_string_lossy().into_owned()]),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect_err("unknown reply recipient must fail closed");
+                    assert!(error.message.contains("MistyCove"));
+                    assert!(error.message.contains("not registered"));
+
+                    let haystack = storage_root.to_string_lossy().into_owned();
+                    fn tree_contains_name(dir: &std::path::Path, needle: &str) -> bool {
+                        let Ok(entries) = std::fs::read_dir(dir) else {
+                            return false;
+                        };
+                        for entry in entries.flatten() {
+                            if entry.file_name().to_string_lossy().contains(needle) {
+                                return true;
+                            }
+                            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                                && tree_contains_name(&entry.path(), needle)
+                            {
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                    assert!(
+                        !tree_contains_name(&storage_root, "orphan-probe"),
+                        "failed reply must not copy the attachment into {haystack}"
+                    );
                 });
                 Config::reset_cached();
             },
