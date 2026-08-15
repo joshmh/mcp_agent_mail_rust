@@ -8,7 +8,9 @@
 //! The hook path is `AM_NOTIFY_HOOK`. Unset means "not yet deployed" — send
 //! still succeeds; the skuld sweep is the backstop. A *configured* hook that
 //! cannot be spawned is logged at error (fail-loud). The hook is fire-and-
-//! forget so `send_message` never waits on the idle gate.
+//! forget so `send_message` never waits on the idle gate. The child is
+//! detached from the daemon's stdio and reaped (`setsid -f`, or a reaper
+//! thread) so a long-lived server does not accumulate zombies.
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -90,30 +92,16 @@ fn spawn_one(
     recipient: &str,
     importance: &str,
 ) {
-    let mut cmd = Command::new(hook);
-    cmd.arg(recipient)
-        .env("AM_NOTIFY_RECIPIENT", recipient)
-        .env("AM_NOTIFY_PROJECT", project_key)
-        .env("AM_NOTIFY_PROJECT_SLUG", project_slug)
-        .env("AM_NOTIFY_MESSAGE_ID", message_id.to_string())
-        .env("AM_NOTIFY_IMPORTANCE", importance)
-        .stdin(Stdio::null())
-        // aud-axg: never inherit the daemon's stdout/stderr. The default
-        // transport is stdio JSON-RPC; a child's "coalesced ..." line
-        // corrupts the MCP stream.
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    match cmd.spawn() {
-        Ok(child) => {
+    match spawn_detached(hook, project_key, project_slug, message_id, recipient, importance) {
+        Ok(pid) => {
             tracing::info!(
                 hook = ?hook,
                 recipient,
                 project = %project_slug,
                 message_id,
-                pid = child.id(),
+                pid,
                 "spawned AM_NOTIFY_HOOK"
             );
-            // Do not wait. The hook's idle-gate can last minutes.
         }
         Err(error) => {
             tracing::error!(
@@ -129,6 +117,107 @@ fn spawn_one(
             );
         }
     }
+}
+
+fn apply_hook_stdio_and_env(
+    cmd: &mut Command,
+    project_key: &str,
+    project_slug: &str,
+    message_id: i64,
+    recipient: &str,
+    importance: &str,
+) {
+    cmd.env("AM_NOTIFY_RECIPIENT", recipient)
+        .env("AM_NOTIFY_PROJECT", project_key)
+        .env("AM_NOTIFY_PROJECT_SLUG", project_slug)
+        .env("AM_NOTIFY_MESSAGE_ID", message_id.to_string())
+        .env("AM_NOTIFY_IMPORTANCE", importance)
+        .stdin(Stdio::null())
+        // aud-axg: never inherit the daemon's stdout/stderr.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+}
+
+/// Fire-and-forget spawn that does not leave zombies in the long-lived
+/// daemon (aud-mz1) and does not share the daemon's stdio (aud-axg).
+///
+/// On Unix, `setsid -f` double-forks: we wait on the short-lived setsid
+/// parent (milliseconds) and the hook runs in a new session reparented
+/// to init. Fallback is a new process group plus a reaper thread.
+fn spawn_detached(
+    hook: &OsStr,
+    project_key: &str,
+    project_slug: &str,
+    message_id: i64,
+    recipient: &str,
+    importance: &str,
+) -> std::io::Result<u32> {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = spawn_via_setsid(
+            hook,
+            project_key,
+            project_slug,
+            message_id,
+            recipient,
+            importance,
+        ) {
+            return Ok(pid);
+        }
+    }
+
+    let mut cmd = Command::new(hook);
+    cmd.arg(recipient);
+    apply_hook_stdio_and_env(
+        &mut cmd,
+        project_key,
+        project_slug,
+        message_id,
+        recipient,
+        importance,
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    // Reap so an exited hook does not sit as a zombie under the daemon.
+    let _ = std::thread::Builder::new()
+        .name(format!("am-notify-reap-{pid}"))
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    Ok(pid)
+}
+
+#[cfg(unix)]
+fn spawn_via_setsid(
+    hook: &OsStr,
+    project_key: &str,
+    project_slug: &str,
+    message_id: i64,
+    recipient: &str,
+    importance: &str,
+) -> std::io::Result<u32> {
+    let mut cmd = Command::new("/usr/bin/setsid");
+    cmd.arg("-f").arg(hook).arg(recipient);
+    apply_hook_stdio_and_env(
+        &mut cmd,
+        project_key,
+        project_slug,
+        message_id,
+        recipient,
+        importance,
+    );
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    // setsid -f: this child is the fork parent and exits immediately
+    // after creating the new session. wait() is milliseconds; the hook
+    // is already detached and will be reaped by init.
+    let _ = child.wait();
+    Ok(pid)
 }
 
 #[cfg(test)]
